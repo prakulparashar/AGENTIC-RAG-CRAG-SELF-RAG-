@@ -4,10 +4,9 @@ import os
 import re
 import sqlite3
 import tempfile
-from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
 from dotenv import load_dotenv
-from langchain.text_splitter import RecursiveCharacterTextSplitterg
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -15,10 +14,11 @@ from langchain_core.messages import BaseMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import add_messages
 from langchain_tavily import TavilySearch
+from langchain_text_splitters import RecursiveCharacterTextSplitter  
+from langgraph.checkpoint.sqlite import SqliteSaver                 
+from langgraph.graph import START, StateGraph
+from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from pydantic import BaseModel, Field
 
@@ -33,8 +33,8 @@ embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 # -------------------
 # 2. CRAG thresholds
 # -------------------
-UPPER_TH = 0.7   
-LOWER_TH = 0.3   
+UPPER_TH = 0.7
+LOWER_TH = 0.3
 
 # -------------------
 # 3. PDF retriever store (per thread)
@@ -65,7 +65,6 @@ def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None
             chunk_size=1000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
         )
         chunks = splitter.split_documents(docs)
-        # Sanitize encoding (from the CRAG notebook)
         for d in chunks:
             d.page_content = d.page_content.encode("utf-8", "ignore").decode("utf-8", "ignore")
 
@@ -97,8 +96,8 @@ def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None
 # 4. CRAG — Scorer
 # -------------------
 class DocEvalScore(BaseModel):
-    score: float 
-    reason: str 
+    score: float
+    reason: str
 
 
 _doc_eval_prompt = ChatPromptTemplate.from_messages([
@@ -180,9 +179,9 @@ def _web_search(query: str) -> List[Document]:
 
 
 # -------------------
-# 7. CRAG — Sentence-level knowledge refinement
+# 7. CRAG — knowledge refinement
 # -------------------
-def _decompose_to_sentences(text: str) -> List[str]:
+def _decompose_to_sentences(text: str) -> List[str]:   #decomposition
     text = re.sub(r"\s+", " ", text).strip()
     sentences = re.split(r"(?<=[.!?])\s+", text)
     return [s.strip() for s in sentences if len(s.strip()) > 20]
@@ -204,15 +203,12 @@ _filter_chain = _filter_prompt | llm.with_structured_output(KeepOrDrop)
 
 
 def _refine_context(question: str, docs: List[Document]) -> str:
-    """Decompose docs into sentences, filter to only relevant ones."""
     combined = "\n\n".join(d.page_content for d in docs).strip()
     sentences = _decompose_to_sentences(combined)
-
     kept = [
         s for s in sentences
         if _filter_chain.invoke({"question": question, "sentence": s}).keep
     ]
-
     return "\n".join(kept).strip()
 
 
@@ -226,7 +222,7 @@ def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
 
     Pipeline:
       1. Retrieve top-k chunks from the PDF vector store
-      2. Score each chunk 0–1 for relevance
+      2. Score each chunk 0-1 for relevance
       3. Verdict:
            CORRECT   → refine PDF chunks only
            INCORRECT → rewrite query + web search only
@@ -252,15 +248,12 @@ def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
     web_docs: List[Document] = []
     web_query: Optional[str] = None
 
-    # Step 4 — Corrective action based on verdict
+    # Step 4 — Corrective action
     if verdict in ("INCORRECT", "AMBIGUOUS"):
         web_query = _rewrite_query(query)
         web_docs = _web_search(web_query)
 
-    # Assemble docs for refinement
-    # CORRECT   → PDF only
-    # INCORRECT → web only
-    # AMBIGUOUS → PDF + web
+    # Step 5 — Assemble docs for refinement
     if verdict == "CORRECT":
         docs_to_refine = good_docs
     elif verdict == "INCORRECT":
@@ -268,7 +261,7 @@ def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
     else:  # AMBIGUOUS
         docs_to_refine = good_docs + web_docs
 
-    # Step 5 — Sentence-level refinement
+    # Step 6 — Sentence-level refinement
     refined_context = _refine_context(query, docs_to_refine)
 
     return {
@@ -339,7 +332,7 @@ checkpointer = SqliteSaver(conn=conn)
 
 
 # -------------------
-# 13. Graph  (unchanged structure)
+# 13. Graph
 # -------------------
 graph = StateGraph(ChatState)
 graph.add_node("chat_node", chat_node)
