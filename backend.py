@@ -15,14 +15,13 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_tavily import TavilySearch
-from langchain_text_splitters import RecursiveCharacterTextSplitter  
-from langgraph.checkpoint.sqlite import SqliteSaver                  
-from langgraph.graph import START, StateGraph
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.config import get_config
+from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-from pydantic import BaseModel, Field
-from langchain_core.runnables import RunnableConfig
-from langgraph.config import get_config
+from pydantic import BaseModel
 
 load_dotenv()
 
@@ -95,7 +94,22 @@ def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None
 
 
 # -------------------
-# 4. CRAG — Scorer
+# 4. CRAG Subgraph — State
+# -------------------
+class CRAGState(TypedDict):
+    question: str
+    thread_id: str
+    docs: List[Document]
+    good_docs: List[Document]
+    verdict: str
+    reason: str
+    web_query: str
+    web_docs: List[Document]
+    refined_context: str
+
+
+# -------------------
+# 5. CRAG Subgraph — Scorer
 # -------------------
 class DocEvalScore(BaseModel):
     score: float
@@ -118,35 +132,48 @@ _doc_eval_prompt = ChatPromptTemplate.from_messages([
 _doc_eval_chain = _doc_eval_prompt | llm.with_structured_output(DocEvalScore)
 
 
-def _eval_docs(question: str, docs: List[Document]) -> tuple[List[Document], str, str]:
-    """
-    Score each doc and return (good_docs, verdict, reason).
+# -------------------
+# 6. CRAG Subgraph — Nodes
+# -------------------
+def retrieve_node(state: CRAGState) -> CRAGState:
+    retriever = _get_retriever(state["thread_id"])
+    if retriever is None:
+        return {"docs": []}
+    return {"docs": retriever.invoke(state["question"])}
 
-    Verdicts:
-      CORRECT   — at least one doc > UPPER_TH  → use PDF only
-      INCORRECT — all docs < LOWER_TH           → use web only
-      AMBIGUOUS — in between                    → use PDF + web
-    """
+
+def eval_each_doc_node(state: CRAGState) -> CRAGState:
+    question = state["question"]
     scores: List[float] = []
     good_docs: List[Document] = []
 
-    for doc in docs:
+    for doc in state["docs"]:
         result = _doc_eval_chain.invoke({"question": question, "chunk": doc.page_content})
         scores.append(result.score)
         if result.score > LOWER_TH:
             good_docs.append(doc)
 
     if any(s > UPPER_TH for s in scores):
-        return good_docs, "CORRECT", f"At least one chunk scored > {UPPER_TH}."
-
+        return {
+            "good_docs": good_docs,
+            "verdict": "CORRECT",
+            "reason": f"At least one chunk scored > {UPPER_TH}.",
+        }
     if scores and all(s < LOWER_TH for s in scores):
-        return [], "INCORRECT", f"All chunks scored < {LOWER_TH}."
-
-    return good_docs, "AMBIGUOUS", f"No chunk > {UPPER_TH}, but not all < {LOWER_TH}."
+        return {
+            "good_docs": [],
+            "verdict": "INCORRECT",
+            "reason": f"All chunks scored < {LOWER_TH}.",
+        }
+    return {
+        "good_docs": good_docs,
+        "verdict": "AMBIGUOUS",
+        "reason": f"No chunk > {UPPER_TH}, but not all < {LOWER_TH}.",
+    }
 
 
 # -------------------
-# 5. CRAG — Query rewriter
+# 7. CRAG Subgraph — Query rewriter
 # -------------------
 class WebQuery(BaseModel):
     query: str
@@ -156,7 +183,7 @@ _rewrite_prompt = ChatPromptTemplate.from_messages([
     ("system",
      "Rewrite the user question into a web search query composed of keywords.\n"
      "Rules:\n"
-     "- Keep it short (6–14 words).\n"
+     "- Keep it short (6-14 words).\n"
      "- If the question implies recency (recent/latest/last week), add a constraint like (last 30 days).\n"
      "- Do NOT answer the question.\n"
      "- Return JSON with a single key: query"),
@@ -166,21 +193,22 @@ _rewrite_prompt = ChatPromptTemplate.from_messages([
 _rewrite_chain = _rewrite_prompt | llm.with_structured_output(WebQuery)
 
 
-def _rewrite_query(question: str) -> str:
-    return _rewrite_chain.invoke({"question": question}).query
+def rewrite_query_node(state: CRAGState) -> CRAGState:
+    result = _rewrite_chain.invoke({"question": state["question"]})
+    return {"web_query": result.query}
 
 
 # -------------------
-# 6. CRAG — Web search (Tavily)
+# 8. CRAG Subgraph — Web search
 # -------------------
 _tavily = TavilySearch(max_results=5)
 
 
-def _web_search(query: str) -> List[Document]:
+def web_search_node(state: CRAGState) -> CRAGState:
+    query = state.get("web_query") or state["question"]
     results = _tavily.invoke({"query": query})
     web_docs = []
     for r in results or []:
-        # newer langchain-tavily returns strings, older returns dicts
         if isinstance(r, str):
             web_docs.append(Document(page_content=r, metadata={"source": "web"}))
         else:
@@ -189,11 +217,11 @@ def _web_search(query: str) -> List[Document]:
             content = r.get("content", "") or r.get("snippet", "")
             text = f"TITLE: {title}\nURL: {url}\nCONTENT:\n{content}"
             web_docs.append(Document(page_content=text, metadata={"url": url, "title": title}))
-    return web_docs
+    return {"web_docs": web_docs}
 
 
 # -------------------
-# 7. CRAG — Sentence-level knowledge refinement
+# 9. CRAG Subgraph — Refinement
 # -------------------
 def _decompose_to_sentences(text: str) -> List[str]:
     text = re.sub(r"\s+", " ", text).strip()
@@ -216,37 +244,69 @@ _filter_prompt = ChatPromptTemplate.from_messages([
 _filter_chain = _filter_prompt | llm.with_structured_output(KeepOrDrop)
 
 
-def _refine_context(question: str, docs: List[Document]) -> str:
-    combined = "\n\n".join(d.page_content for d in docs).strip()
+def refine_node(state: CRAGState) -> CRAGState:
+    question = state["question"]
+    verdict = state.get("verdict", "INCORRECT")
+
+    if verdict == "CORRECT":
+        docs_to_use = state["good_docs"]
+    elif verdict == "INCORRECT":
+        docs_to_use = state["web_docs"]
+    else:  # AMBIGUOUS
+        docs_to_use = state["good_docs"] + state["web_docs"]
+
+    combined = "\n\n".join(d.page_content for d in docs_to_use).strip()
     sentences = _decompose_to_sentences(combined)
     kept = [
         s for s in sentences
         if _filter_chain.invoke({"question": question, "sentence": s}).keep
     ]
-    return "\n".join(kept).strip()
+    return {"refined_context": "\n".join(kept).strip()}
 
 
 # -------------------
-# 8. CRAG-enhanced rag_tool
+# 10. CRAG Subgraph — Routing
+# -------------------
+def route_after_eval(state: CRAGState) -> str:
+    if state["verdict"] == "CORRECT":
+        return "refine"
+    return "rewrite_query"
+
+
+# -------------------
+# 11. Build CRAG subgraph
+# -------------------
+crag_graph = StateGraph(CRAGState)
+
+crag_graph.add_node("retrieve", retrieve_node)
+crag_graph.add_node("eval_each_doc", eval_each_doc_node)
+crag_graph.add_node("rewrite_query", rewrite_query_node)
+crag_graph.add_node("web_search", web_search_node)
+crag_graph.add_node("refine", refine_node)
+
+crag_graph.add_edge(START, "retrieve")
+crag_graph.add_edge("retrieve", "eval_each_doc")
+crag_graph.add_conditional_edges(
+    "eval_each_doc",
+    route_after_eval,
+    {"refine": "refine", "rewrite_query": "rewrite_query"},
+)
+crag_graph.add_edge("rewrite_query", "web_search")
+crag_graph.add_edge("web_search", "refine")
+crag_graph.add_edge("refine", END)
+
+crag_pipeline = crag_graph.compile()
+
+
+# -------------------
+# 12. rag_tool — calls the CRAG subgraph
 # -------------------
 @tool
-def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
+def rag_tool(query: str = "summarize the document", thread_id: Optional[str] = None) -> dict:
     """
     Retrieve relevant information from the uploaded PDF using Corrective RAG (CRAG).
-
-    Pipeline:
-      1. Retrieve top-k chunks from the PDF vector store
-      2. Score each chunk 0-1 for relevance
-      3. Verdict:
-           CORRECT   → refine PDF chunks only
-           INCORRECT → rewrite query + web search only
-           AMBIGUOUS → refine PDF chunks + web search
-      4. Sentence-level filter to remove irrelevant sentences
-      5. Return refined context
-
     Always include the thread_id when calling this tool.
     """
-
     if not thread_id:
         try:
             config = get_config()
@@ -261,63 +321,50 @@ def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
             "query": query,
         }
 
-    # Step 1 — Retrieve
-    raw_docs = retriever.invoke(query)
-
-    # Step 2+3 — Score & verdict
-    good_docs, verdict, reason = _eval_docs(query, raw_docs)
-
-    web_docs: List[Document] = []
-    web_query: Optional[str] = None
-
-    # Step 4 — Corrective action
-    if verdict in ("INCORRECT", "AMBIGUOUS"):
-        web_query = _rewrite_query(query)
-        web_docs = _web_search(web_query)
-
-    # Step 5 — Assemble docs for refinement
-    if verdict == "CORRECT":
-        docs_to_refine = good_docs
-    elif verdict == "INCORRECT":
-        docs_to_refine = web_docs
-    else:  # AMBIGUOUS
-        docs_to_refine = good_docs + web_docs
-
-    # Step 6 — Sentence-level refinement
-    refined_context = _refine_context(query, docs_to_refine)
+    # CRAG subgraph
+    result = crag_pipeline.invoke({
+        "question": query,
+        "thread_id": thread_id,
+        "docs": [],
+        "good_docs": [],
+        "verdict": "",
+        "reason": "",
+        "web_query": "",
+        "web_docs": [],
+        "refined_context": "",
+    })
 
     return {
         "query": query,
-        "refined_context": refined_context,
-        "verdict": verdict,
-        "reason": reason,
-        "web_query": web_query,
+        "refined_context": result["refined_context"],
+        "verdict": result["verdict"],
+        "reason": result["reason"],
+        "web_query": result.get("web_query"),
         "source_file": _THREAD_METADATA.get(str(thread_id), {}).get("filename"),
         "relevance_grades": {
-            "total_chunks": len(raw_docs),
-            "good_chunks": len(good_docs),
-            "web_search_triggered": verdict != "CORRECT",
+            "total_chunks": len(result["docs"]),
+            "good_chunks": len(result["good_docs"]),
+            "web_search_triggered": result["verdict"] != "CORRECT",
         },
     }
 
 
 # -------------------
-# 9. Remaining tools + LLM binding
+# 13. Tools + LLM binding
 # -------------------
-# Add back your other tools (search_tool, get_stock_price, calculator) here
-tools = [rag_tool]  # e.g. tools = [search_tool, get_stock_price, calculator, rag_tool]
+tools = [rag_tool]
 llm_with_tools = llm.bind_tools(tools)
 
 
 # -------------------
-# 10. State
+# 14. Chat State
 # -------------------
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
 
 # -------------------
-# 11. Nodes
+# 15. Chat Node
 # -------------------
 def chat_node(state: ChatState, config=None):
     thread_id = None
@@ -326,21 +373,22 @@ def chat_node(state: ChatState, config=None):
 
     system_message = SystemMessage(
         content=(
-            "You are a helpful assistant with access to a Corrective RAG pipeline.\n\n"
-            "For EVERY user question, you MUST call `rag_tool` with the "
-            f"thread_id `{thread_id}` before answering.\n\n"
-            "Do not answer from memory. Always call the tool first.\n\n"
-            "The tool returns a `verdict` field — use it to frame your answer:\n"
-            "  • CORRECT   → answer came from the PDF alone\n"
-            "  • INCORRECT → PDF had no relevant info; answer is from a web search\n"
-            "  • AMBIGUOUS → answer combines the PDF and a web search\n\n"
-            "If the tool returns an error saying no document is indexed, "
-            "tell the user to upload a PDF from the sidebar."
+            f"You are a helpful assistant. thread_id is `{thread_id}`.\n\n"
+            "Rules:\n"
+            "1. For greetings or casual chat — respond with a short friendly message. Never return empty.\n"
+            "2. For questions about a document or PDF — call `rag_tool` with thread_id and the user question as query.\n"
+            "3. For general questions — answer directly, no need to call `rag_tool`.\n"
+            "4. Never return an empty response under any circumstance."
         )
     )
 
     messages = [system_message, *state["messages"]]
     response = llm_with_tools.invoke(messages, config=config)
+
+    if not response.content and not response.tool_calls:
+        from langchain_core.messages import AIMessage
+        return {"messages": [AIMessage(content="Hello! How can I help you today?")]}
+
     return {"messages": [response]}
 
 
@@ -348,14 +396,14 @@ tool_node = ToolNode(tools)
 
 
 # -------------------
-# 12. Checkpointer
+# 16. Checkpointer
 # -------------------
 conn = sqlite3.connect(database="chatbot.db", check_same_thread=False)
 checkpointer = SqliteSaver(conn=conn)
 
 
 # -------------------
-# 13. Graph
+# 17. Main chat graph
 # -------------------
 graph = StateGraph(ChatState)
 graph.add_node("chat_node", chat_node)
@@ -369,7 +417,7 @@ chatbot = graph.compile(checkpointer=checkpointer)
 
 
 # -------------------
-# 14. Helpers
+# 18. Helpers
 # -------------------
 def retrieve_all_threads():
     all_threads = set()
