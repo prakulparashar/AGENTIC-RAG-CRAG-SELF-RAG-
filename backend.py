@@ -326,20 +326,16 @@ def chat_node(state: ChatState, config=None):
 
     system_message = SystemMessage(
         content=(
-           "You are a helpful assistant.\n\n"
-        "RULE 1: For greetings, casual conversation, general knowledge, coding, math, "
-        "or any question NOT about a document — answer directly. Do NOT call any tool.\n\n"
-        "RULE 2: Only call `rag_tool` with thread_id `{thread_id}` when the user is "
-        "clearly asking about the content of an uploaded PDF or document.\n\n"
-        "Examples of when NOT to call the tool: 'hi', 'hello', 'how are you', "
-        "'what is Python', 'explain machine learning'.\n\n"
-        "Examples of when to call the tool: 'what is this PDF about', "
-        "'summarize the document', 'what does it say about X'.\n\n"
-        "When you do call rag_tool, use the verdict to frame your answer:\n"
-        "  • CORRECT   → answer came from the PDF\n"
-        "  • INCORRECT → used web search\n"
-        "  • AMBIGUOUS → combined PDF and web search\n\n"
-        "If the tool returns a no-document error, ask the user to upload a PDF."
+            "You are a helpful assistant with access to a Corrective RAG pipeline.\n\n"
+            "For EVERY user question, you MUST call `rag_tool` with the "
+            f"thread_id `{thread_id}` before answering.\n\n"
+            "Do not answer from memory. Always call the tool first.\n\n"
+            "The tool returns a `verdict` field — use it to frame your answer:\n"
+            "  • CORRECT   → answer came from the PDF alone\n"
+            "  • INCORRECT → PDF had no relevant info; answer is from a web search\n"
+            "  • AMBIGUOUS → answer combines the PDF and a web search\n\n"
+            "If the tool returns an error saying no document is indexed, "
+            "tell the user to upload a PDF from the sidebar."
         )
     )
 
