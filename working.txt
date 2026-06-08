@@ -1,0 +1,36 @@
+in context learning -> only in big models with many parameters
+
+STEPS OF INDEXING
+1.DOCUMENT LOADER:-
+TOOLS = LANGCHAIN LOADERS ()PYPDFLOADER, YOUTUBE LOADER ETC.
+1. chunking
+3. embedding (converts data into an array of many non-zero numbers, vectors)
+4.vector store (local and cloud)
+
+
+
+MODELS AND TOOLS:-
+messages:-
+1. ai_message 
+2. tool_message
+3. system message(instruction)
+4. user message(prompt)
+
+#PYDANTIC -> so its basically to get response in a desired structure (field validation and predefining data types for variables[field validation]) and nested structures
+#typedict -> not as strict is pydantic, does not throw error if you pass bad data, professional definition: no runtime field validation unlike pydantic
+
+when you pass a typedict or pydantic model in the response_format field of the agent, the response dictionary that the model resturn get a new key called "structured_response" which has the response as defined by typedict or pydantic
+
+#middlewares = a list of predefined middlewares is available in langchain docs, look for it 
+
+
+#MESSAGES (STATE)
+1. state is created with messages variable. this holds al the ai messages and user messages
+2. this state is passed in the laggraph node (chatbot node) so that the node can access it anytime for context
+
+class ChatState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+
+here, add_messages is reducer (reducer is used to append the convo history to the messages variable). another function is when it sees a message with an ID which is already there in the history, it just replaces the old text. annotated also helps achieving the same "append" logic
+
+3. at the end of the node, we update the global state with the response of the AI

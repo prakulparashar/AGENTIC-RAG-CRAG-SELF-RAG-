@@ -40,13 +40,13 @@ LOWER_TH = 0.3
 # -------------------
 # 3. PDF retriever store (per thread)
 # -------------------
-_THREAD_RETRIEVERS: Dict[str, Any] = {}
+_THREAD_RETRIEVERS: Dict[str, Any] = {} #global dictionaries,stores the pointers to the vector stores , because we are assigning dedicated vector store to its dedicated thread:id (user).
 _THREAD_METADATA: Dict[str, dict] = {}
 
 
 def _get_retriever(thread_id: Optional[str]):
-    if thread_id and thread_id in _THREAD_RETRIEVERS:
-        return _THREAD_RETRIEVERS[thread_id]
+    if thread_id and thread_id in _THREAD_RETRIEVERS: #suppose if user makes req. with thread_id_abc, this fxn looks for that ID in the dict we defined above. if it exists....
+        return _THREAD_RETRIEVERS[thread_id] #...if it exists, then this returns the pointer pointing to the vector store for the thread_id_abc
     return None
 
 
@@ -69,12 +69,12 @@ def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None
         for d in chunks:
             d.page_content = d.page_content.encode("utf-8", "ignore").decode("utf-8", "ignore")
 
-        vector_store = FAISS.from_documents(chunks, embeddings)
-        retriever = vector_store.as_retriever(
+        vector_store = FAISS.from_documents(chunks, embeddings)         #EMBEDDING being passed as arguments, FAISS now knows how to embedd even the queries
+        retriever = vector_store.as_retriever(                          # retriever.invoke() can be used now 
             search_type="similarity", search_kwargs={"k": 4}
         )
 
-        _THREAD_RETRIEVERS[str(thread_id)] = retriever
+        _THREAD_RETRIEVERS[str(thread_id)] = retriever #This line is the exact moment where the vector store is officially saved and locked to that specific user's ID inside the global storage box.
         _THREAD_METADATA[str(thread_id)] = {
             "filename": filename or os.path.basename(temp_path),
             "documents": len(docs),
@@ -111,7 +111,7 @@ class CRAGState(TypedDict):
 # -------------------
 # 5. CRAG Subgraph — Scorer
 # -------------------
-class DocEvalScore(BaseModel):
+class DocEvalScore(BaseModel): #basemodel manje pydantic
     score: float
     reason: str
 
@@ -129,17 +129,17 @@ _doc_eval_prompt = ChatPromptTemplate.from_messages([
     ("human", "Question: {question}\n\nChunk:\n{chunk}"),
 ])
 
-_doc_eval_chain = _doc_eval_prompt | llm.with_structured_output(DocEvalScore)
-
+_doc_eval_chain = _doc_eval_prompt | llm.with_structured_output(DocEvalScore) #created an agent using langchain, prompt is _doc_eval_prompt  passed the pydantic format named "docevalscore". so the response will be in that format only.
+#Notes: | is called the pipe operator in langchain. this means the take whatever is on the left and feed to the right.
 
 # -------------------
 # 6. CRAG Subgraph — Nodes
 # -------------------
-def retrieve_node(state: CRAGState) -> CRAGState:
-    retriever = _get_retriever(state["thread_id"])
+def retrieve_node(state: CRAGState) -> CRAGState: #outputs a CRAGState
+    retriever = _get_retriever(state["thread_id"]) #calls the get_retriever fxn to call get the needed vector store for the respective thread id
     if retriever is None:
-        return {"docs": []}
-    return {"docs": retriever.invoke(state["question"])}
+        return {"docs": []} #if query is ade before a PDF is uploaded, this line handles it by returning empty set of DOCS
+    return {"docs": retriever.invoke(state["question"])}  #retriever.invoke retrieves the chunks from the vector store. the user's query is passed from the "question" state. the retrieved chunks are stored in "docs" state
 
 
 def eval_each_doc_node(state: CRAGState) -> CRAGState:
@@ -155,7 +155,7 @@ def eval_each_doc_node(state: CRAGState) -> CRAGState:
 
     if any(s > UPPER_TH for s in scores):
         return {
-            "good_docs": good_docs,
+            "good_docs": good_docs, #good_docs used later in the refinement function (part 9)
             "verdict": "CORRECT",
             "reason": f"At least one chunk scored > {UPPER_TH}.",
         }
@@ -194,8 +194,8 @@ _rewrite_chain = _rewrite_prompt | llm.with_structured_output(WebQuery)
 
 
 def rewrite_query_node(state: CRAGState) -> CRAGState:
-    result = _rewrite_chain.invoke({"question": state["question"]})
-    return {"web_query": result.query}
+    result = _rewrite_chain.invoke({"question": state["question"]})    #accesing the original prompt by the user from the state and passing it in the .invoke() function. 
+    return {"web_query": result.query} #updates the state
 
 
 # -------------------
@@ -249,7 +249,7 @@ def refine_node(state: CRAGState) -> CRAGState:
     verdict = state.get("verdict", "INCORRECT")
 
     if verdict == "CORRECT":
-        docs_to_use = state["good_docs"]
+        docs_to_use = state["good_docs"] #good_docs were updated above in part 6
     elif verdict == "INCORRECT":
         docs_to_use = state["web_docs"]
     else:  # AMBIGUOUS
@@ -295,7 +295,7 @@ crag_graph.add_edge("rewrite_query", "web_search")
 crag_graph.add_edge("web_search", "refine")
 crag_graph.add_edge("refine", END)
 
-crag_pipeline = crag_graph.compile()
+crag_pipeline = crag_graph.compile()    #CRAG pipeline/graph being binded. graph cant be implemented if its not compiled/binded. 
 
 
 # -------------------
@@ -322,7 +322,7 @@ def rag_tool(query: str = "summarize the document", thread_id: Optional[str] = N
         }
 
     # CRAG subgraph
-    result = crag_pipeline.invoke({
+    result = crag_pipeline.invoke({ #CRAG pipeline/graph being binded, initial state being passed on every query
         "question": query,
         "thread_id": thread_id,
         "docs": [],
@@ -334,7 +334,7 @@ def rag_tool(query: str = "summarize the document", thread_id: Optional[str] = N
         "refined_context": "",
     })
 
-    return {
+    return {                                                #returns a list
         "query": query,
         "refined_context": result["refined_context"],
         "verdict": result["verdict"],
@@ -353,14 +353,14 @@ def rag_tool(query: str = "summarize the document", thread_id: Optional[str] = N
 # 13. Tools + LLM binding
 # -------------------
 tools = [rag_tool]
-llm_with_tools = llm.bind_tools(tools)
+llm_with_tools = llm.bind_tools(tools)   # {modename}_with_tools used to bind the tool with the model
 
 
 # -------------------
 # 14. Chat State
 # -------------------
 class ChatState(TypedDict):
-    messages: Annotated[list[BaseMessage], add_messages]
+    messages: Annotated[list[BaseMessage], add_messages] #add_messages is the reducer function, by adding this, we are not rewriting, we are appending
 
 
 # -------------------
@@ -382,17 +382,17 @@ def chat_node(state: ChatState, config=None):
         )
     )
 
-    messages = [system_message, *state["messages"]]
+    messages = [system_message, *state["messages"]]  #* creates a temp state, cuz the system response is only required for the current response generation , thats why its not stored in the global state. only the AI response in appendede in the global state at line 392
     response = llm_with_tools.invoke(messages, config=config)
 
     if not response.content and not response.tool_calls:
         from langchain_core.messages import AIMessage
         return {"messages": [AIMessage(content="Hello! How can I help you today?")]}
 
-    return {"messages": [response]}
+    return {"messages": [response]} #AI response being appended in the global state
 
 
-tool_node = ToolNode(tools)
+tool_node = ToolNode(tools) #predefined by langgraph. langgraph cant directly execute the rag+tool code, so in simple terms we wrap the rag_tool inside a tool node, and then we can add the tool node in the graph, basically tool node "executes" the rag_tool
 
 
 # -------------------
@@ -432,3 +432,25 @@ def thread_has_document(thread_id: str) -> bool:
 
 def thread_document_metadata(thread_id: str) -> dict:
     return _THREAD_METADATA.get(str(thread_id), {})
+
+
+
+
+
+#rag_tool hands over the CRAGState to the subgraph. subgraph gives the optimal context (using websearch amd all). and then the llm is binded with this tool. then we invoke the llm in the chatnode, after which the rag_tool returns us the context required by the llm. 
+
+#now we create the main graph. is starts, reaches chat_node, chatnode executes the tool node(basically rag_tool). and then llm has the context and generates the response
+
+
+
+
+
+
+
+
+
+
+
+
+#the main graph executed the chat_node, since we are invoking the llm inside this node, it return an AImessage which tells us that we have to call the rag_tool (since that is the tool bindede with our llm)
+#then we reach the tool_node, which physically executes the rag_tool and runs the CRAG subgraph (FAISS retrieval, grading, web search fallback).
