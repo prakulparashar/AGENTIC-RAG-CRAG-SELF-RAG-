@@ -40,7 +40,7 @@ LOWER_TH = 0.3
 # -------------------
 # 3. PDF retriever store (per thread)
 # -------------------
-_THREAD_RETRIEVERS: Dict[str, Any] = {} #global dictionaries,stores the pointers to the vector stores , because we are assigning dedicated vector store to its dedicated thread:id (user).
+_THREAD_RETRIEVERS: Dict[str, Any] = {} #global dictionaries,stores the pointers to the vector stores , because we are assigning dedicated FAISS store to its dedicated thread:id (user). it is a dict. where every thread id (key) is associated with its respective retriever object, and each retriever object points to the FAISS store of THAT thread_id only. get retriever function just returns the retriever object of THAT thread id
 _THREAD_METADATA: Dict[str, dict] = {}
 
 
@@ -69,12 +69,12 @@ def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None
         for d in chunks:
             d.page_content = d.page_content.encode("utf-8", "ignore").decode("utf-8", "ignore")
 
-        vector_store = FAISS.from_documents(chunks, embeddings)         #EMBEDDING being passed as arguments, FAISS now knows how to embedd even the queries
-        retriever = vector_store.as_retriever(                          # retriever.invoke() can be used now 
+        vector_store = FAISS.from_documents(chunks, embeddings)         #EMBEDDING being passed as arguments, FAISS now knows how to embedd even the queries. vector_store now becomes an object. in the below line, .as_retriever is the method
+        retriever = vector_store.as_retriever(                          # retriever.invoke() can be used now . basically .invoke()is the method which actually does the retrieval, and as_retriever is used to create the retriever object
             search_type="similarity", search_kwargs={"k": 4}
         )
 
-        _THREAD_RETRIEVERS[str(thread_id)] = retriever #This line is the exact moment where the vector store is officially saved and locked to that specific user's ID inside the global storage box.
+        _THREAD_RETRIEVERS[str(thread_id)] = retriever #at this moment, the retriever object is assigned to the respective thread_id and this key-value pair is stored INSIDE the _THREAD_RETRIEVERS dictionary, which is global.
         _THREAD_METADATA[str(thread_id)] = {
             "filename": filename or os.path.basename(temp_path),
             "documents": len(docs),
@@ -136,12 +136,12 @@ _doc_eval_chain = _doc_eval_prompt | llm.with_structured_output(DocEvalScore) #c
 # 6. CRAG Subgraph — Nodes
 # -------------------
 def retrieve_node(state: CRAGState) -> CRAGState: #outputs a CRAGState
-    retriever = _get_retriever(state["thread_id"]) #calls the get_retriever fxn to call get the needed vector store for the respective thread id
+    retriever = _get_retriever(state["thread_id"]) #as discussed earlier, get retriever function searches the _THREAD_RETRIEVERS dict and returns to retriever object of THAT thread_id
     if retriever is None:
-        return {"docs": []} #if query is ade before a PDF is uploaded, this line handles it by returning empty set of DOCS
+        return {"docs": []} #if query is made before a PDF is uploaded, this line handles it by returning empty set of DOCS
     return {"docs": retriever.invoke(state["question"])}  #retriever.invoke retrieves the chunks from the vector store. the user's query is passed from the "question" state. the retrieved chunks are stored in "docs" state
 
-
+#a good way to think about langgraph node -> return {"docs": retriever.invoke(state["question"])}......in this kind of syntax, the thing on the left is the value of the state which will be updated, and the thing on the right is the method whose return value will replace it, right?
 def eval_each_doc_node(state: CRAGState) -> CRAGState:
     question = state["question"]
     scores: List[float] = []
@@ -295,7 +295,7 @@ crag_graph.add_edge("rewrite_query", "web_search")
 crag_graph.add_edge("web_search", "refine")
 crag_graph.add_edge("refine", END)
 
-crag_pipeline = crag_graph.compile()    #CRAG pipeline/graph being binded. graph cant be implemented if its not compiled/binded. 
+crag_pipeline = crag_graph.compile()    #CRAG pipeline/graph being binded/compiled. now this becomes an executable graph
 
 
 # -------------------
@@ -334,7 +334,7 @@ def rag_tool(query: str = "summarize the document", thread_id: Optional[str] = N
         "refined_context": "",
     })
 
-    return {                                                #returns a list
+    return {                                                #returns a normal python list
         "query": query,
         "refined_context": result["refined_context"],
         "verdict": result["verdict"],
@@ -382,18 +382,22 @@ def chat_node(state: ChatState, config=None):
         )
     )
 
-    messages = [system_message, *state["messages"]]  #* creates a temp state, cuz the system response is only required for the current response generation , thats why its not stored in the global state. only the AI response in appendede in the global state at line 392
-    response = llm_with_tools.invoke(messages, config=config)
+    messages = [system_message, *state["messages"]]  #* creates a temp chatstate, cuz the system message is only required for the current response generation , thats why its not stored in the global chatstate. only the AI message in appended in the global chatstate at line 392
+    response = llm_with_tools.invoke(messages, config=config) #creates AImessage on the first pass, and final LLM response on the second pass. explanation on line 394
 
     if not response.content and not response.tool_calls:
         from langchain_core.messages import AIMessage
-        return {"messages": [AIMessage(content="Hello! How can I help you today?")]}
+        return {"messages": [AIMessage(content="Hello! How can I help you today?")]} #guardrail , if the node fails to create an AImessage
 
     return {"messages": [response]} #AI response being appended in the global state
 
+#on the first pass of chat_node, the messages state consists of system message and human message. on the second pass it consists of ai message and tool message as well********** 
 
 tool_node = ToolNode(tools) #predefined by langgraph. langgraph cant directly execute the rag+tool code, so in simple terms we wrap the rag_tool inside a tool node, and then we can add the tool node in the graph, basically tool node "executes" the rag_tool
 
+#The pre-built LangGraph ToolNode intercepts this raw Python dictionary returned by the rag_tool. Automatically, behind the scenes, it converts that dictionary into a string and wraps it into a formal LangChain ToolMessage.
+#Because ChatState has a built-in message history mechanism (add_messages), LangGraph automatically appends this new ToolMessage straight into your global state["messages"] array
+#when the main graph reaches the chatnode for the second time , this tool message is used to generate the response
 
 # -------------------
 # 16. Checkpointer
@@ -453,4 +457,23 @@ def thread_document_metadata(thread_id: str) -> dict:
 
 
 #the main graph executed the chat_node, since we are invoking the llm inside this node, it return an AImessage which tells us that we have to call the rag_tool (since that is the tool bindede with our llm)
-#then we reach the tool_node, which physically executes the rag_tool and runs the CRAG subgraph (FAISS retrieval, grading, web search fallback).
+#then we reach the tool_node, which physically executes the rag_tool and runs the CRAG subgraph (FAISS retrieval, grading, web search fallback). this gives us the tool message which contains the refined context.
+#then the graph again reached tha chatnode, which uses this refined context to generate the response.
+
+#this is INDUSTRY standard procedure, one node to create ai message and another to create tool message.
+
+
+
+
+
+
+
+
+
+#1. MAIN GRAPH= chatnode(creates ai message by invvoking the llm. ai message informs the llm which tool it needs to call)
+#2. MAINGRAPH REACHES TOOL NODE= tool node calls the rag_tool, which basically implements our subgraph, and then the rag_tool returns a python dicitonary consisting of our refined_context. when we do tools = [rag_tool], llm_with_tools = llm.bind_tools(tools) , our toolmessage gets updated with the refined context
+#3. MAIN GRAPH AGAIN REACHED CHAT_NODE= now chat_node uses this tool_message (which consists of our refined_context)and our final response is generated
+
+
+
+
